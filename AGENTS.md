@@ -5,26 +5,31 @@
 
 ## Overview
 
-macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
+macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it, and sends the transcript + a screenshot of the user's screen to a vision LLM. The model responds with text (streamed via SSE) and voice (TTS). A blue cursor overlay can fly to and point at UI elements the model references on any connected monitor.
 
-All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
+### Provider modes
+
+The AI/voice pipeline has two wirings:
+
+- **Local prototyping (current default):** the app calls Gemini, Deepgram STT, and Deepgram TTS **directly**. Keys load via `LocalSecrets` from the environment or a gitignored `~/Library/Application Support/Clicky/Secrets.json` (`{ "geminiAPIKey": "...", "deepgramAPIKey": "..." }`) — nothing sensitive is committed or shipped.
+- **Shipping (intended; code retained but unused in local mode):** routes through a Cloudflare Worker proxy that holds the keys as secrets, using Claude + AssemblyAI + ElevenLabs. The Worker and the `ClaudeAPI` / `AssemblyAIStreamingTranscriptionProvider` / `ElevenLabsTTSClient` classes are kept intact for this path.
 
 ## Architecture
 
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
-- **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
-- **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
+- **AI Chat**: Gemini 3.5 Flash vision + SSE streaming (`GeminiAPI`, local default; `gemini-3.1-pro-preview` for the "pro" pick). Claude via Cloudflare Worker is the shipping path (`ClaudeAPI`, retained). The model picker's "Sonnet/Opus" labels map onto Gemini flash/pro.
+- **Speech-to-Text**: Deepgram `nova-3` real-time streaming via websocket (`DeepgramStreamingTranscriptionProvider`, default). AssemblyAI (`u3-rt-pro`), OpenAI, and Apple Speech remain selectable providers.
+- **Text-to-Speech**: Deepgram Aura (`aura-2-thalia-en`) via `DeepgramTTSClient` (local default). ElevenLabs (`eleven_flash_v2_5`) via the Worker is the shipping path (`ElevenLabsTTSClient`, retained).
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
-- **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
+- **Element Pointing**: The vision model embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
 
 ### API Proxy (Cloudflare Worker)
 
-The app never calls external APIs directly. All requests go through a Cloudflare Worker (`worker/src/index.ts`) that holds the real API keys as secrets.
+For the shipping build, the app routes requests through a Cloudflare Worker (`worker/src/index.ts`) that holds the real API keys as secrets. **In the current local-prototyping default the Worker is bypassed** — the app calls Gemini/Deepgram directly with keys from `LocalSecrets` (see Provider modes above). The Worker is documented here for the shipping path.
 
 | Route | Upstream | Purpose |
 |-------|----------|---------|
@@ -59,19 +64,23 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
 | `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
-| `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
-| `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. |
+| `BuddyTranscriptionProvider.swift` | ~115 | Protocol surface and provider factory for voice transcription backends. Resolves provider from `VoiceTranscriptionProvider` in Info.plist (currently `deepgram`) — Deepgram, AssemblyAI, OpenAI, or Apple Speech. |
+| `DeepgramStreamingTranscriptionProvider.swift` | ~330 | **Default STT provider (local mode).** Opens a Deepgram `nova-3` websocket directly (key from `LocalSecrets`), streams PCM16 audio, composes interim/final transcripts, delivers finalized text on key-up. Does NOT set a per-task `URLSessionWebSocketDelegate` — that caused "Socket is not connected". |
+| `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider (shipping path, not default). Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, delivers finalized text on key-up. Shares a single URLSession across all sessions. |
 | `OpenAIAudioTranscriptionProvider.swift` | ~317 | Upload-based transcription provider. Buffers push-to-talk audio locally, uploads as WAV on release, returns finalized transcript. |
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
-| `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
+| `GeminiAPI.swift` | ~210 | **Default LLM/vision client (local mode).** Calls Gemini directly (`gemini-3.5-flash`, or `gemini-3.1-pro-preview` for "pro") with SSE streaming + `inline_data` images; key from `LocalSecrets`. Mirrors `ClaudeAPI`'s interface (`analyzeImageStreaming` / `analyzeImage`) so it's a drop-in. |
+| `ClaudeAPI.swift` | ~291 | Claude vision API client (shipping path, retained). Streaming (SSE) and non-streaming modes, TLS warmup, image MIME detection, conversation history. |
 | `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
-| `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
+| `DeepgramTTSClient.swift` | ~80 | **Default TTS client (local mode).** Calls Deepgram Aura (`aura-2-thalia-en`) directly (key from `LocalSecrets`), plays back via `AVAudioPlayer`. Exposes `isPlaying` / `stopPlayback`. |
+| `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client (shipping path, retained). Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
-| `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
+| `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for values stored in the app bundle Info.plist (e.g. `VoiceTranscriptionProvider`). |
+| `LocalSecrets.swift` | ~75 | Loads local-mode API keys (Gemini + Deepgram) from the environment or a gitignored `~/Library/Application Support/Clicky/Secrets.json`. Keeps keys out of the repo and the app binary. |
 | `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
 
 ## Build & Run
@@ -87,6 +96,18 @@ open leanring-buddy.xcodeproj
 ```
 
 **Do NOT run `xcodebuild` from the terminal** — it invalidates TCC (Transparency, Consent, and Control) permissions and the app will need to re-request screen recording, accessibility, etc.
+
+**`ENABLE_DEBUG_DYLIB = NO`** is set on the app target. Xcode 16's debug-dylib feature rebuilds/re-signs the executable on every build, so macOS treats each build as a new app and re-prompts for TCC permissions (Accessibility, Screen Recording). `NO` keeps a single stable-signature executable so grants persist across builds.
+
+### Local secrets (local prototyping mode)
+
+Create `~/Library/Application Support/Clicky/Secrets.json` (kept out of the repo by location — it is never committed):
+
+```json
+{ "geminiAPIKey": "...", "deepgramAPIKey": "..." }
+```
+
+`LocalSecrets` also reads `GEMINI_API_KEY` / `GOOGLE_API_KEY` and `DEEPGRAM_API_KEY` from the environment. Without keys, transcription falls back toward the Worker-based providers (which require the Worker to be deployed).
 
 ## Cloudflare Worker
 
