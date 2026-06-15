@@ -41,6 +41,12 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
+        // Show a Dock icon in addition to the menu bar item. Info.plist is
+        // LSUIElement=true, so we promote to .regular at runtime (same trick as
+        // the production app). The menu bar NSStatusItem stays, so Clicky lives
+        // in BOTH the Dock and the menu bar simultaneously.
+        NSApplication.shared.setActivationPolicy(.regular)
+
         UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 0])
 
         menuBarPanelManager = MenuBarPanelManager(companionManager: companionManager)
@@ -56,6 +62,13 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         companionManager.stop()
+    }
+
+    /// Clicking the Dock icon (with no window showing) opens the companion
+    /// panel, so the Dock presence is actually useful instead of a no-op.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        menuBarPanelManager?.showPanelOnLaunch()
+        return true
     }
 
     /// Registers the app as a login item so it launches automatically on
