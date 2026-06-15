@@ -673,15 +673,24 @@ final class CompanionManager: ObservableObject {
                         // speakText returns after player.play() — audio is now playing
                         voiceState = .responding
                     } catch {
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        let ttsError = error as NSError
+                        let wasInterrupted = error is CancellationError
+                            || (ttsError.domain == NSURLErrorDomain && ttsError.code == NSURLErrorCancelled)
+                        if wasInterrupted {
+                            // TTS was interrupted (new interaction / overlay dismissed) — not a real failure
+                        } else {
+                            print("⚠️ Deepgram TTS error: \(error)")
+                            speakResponseErrorFallback()
+                        }
                     }
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+            } catch let responseError as NSError where responseError.domain == NSURLErrorDomain && responseError.code == NSURLErrorCancelled {
+                // Request was cancelled mid-flight (interrupted) — not a real failure
             } catch {
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                speakResponseErrorFallback()
             }
 
             if !Task.isCancelled {
@@ -721,11 +730,11 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
-    private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
+    /// Speaks a generic error message using macOS system TTS when the AI or
+    /// TTS step genuinely fails (not when a request is merely interrupted).
+    /// Uses NSSpeechSynthesizer so it works even when the TTS provider is down.
+    private func speakResponseErrorFallback() {
+        let utterance = "Sorry, something went wrong on my end. Please try again."
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding
